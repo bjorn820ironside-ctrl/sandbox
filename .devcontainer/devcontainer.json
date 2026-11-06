@@ -1,0 +1,4 @@
+{
+  "name": "sandbox-dev",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu"
+}
