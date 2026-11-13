@@ -1,0 +1,29 @@
+
+services:
+  backend:
+    image: 93.77.164.9:8081/khamitovar-backend-docker/sandbox-backend:latest
+    pull_policy: always
+    env_file:
+      - .env.backend
+    expose:
+      - "8081"
+    networks:
+      - sandbox-network
+    restart: unless-stopped
+
+  frontend:
+    image: 93.77.164.9:8081/khamitovar-frontend-docker/sandbox-frontend:latest
+    pull_policy: always
+    env_file:
+      - .env.frontend
+    ports:
+      - "8888:8888"
+    depends_on:
+      - backend
+    networks:
+      - sandbox-network
+    restart: unless-stopped
+
+networks:
+  sandbox-network:
+    driver: bridge
