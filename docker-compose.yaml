@@ -1,10 +1,8 @@
-
 services:
   backend:
-    image: 93.77.164.9:8081/khamitovar-backend-docker/sandbox-backend:latest
-    pull_policy: always
+    image: ${REPOSITORY_BACKEND}:${IMAGE_TAG}
     env_file:
-      - .env.backend
+      - .env
     expose:
       - "8081"
     networks:
@@ -12,10 +10,9 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: 93.77.164.9:8081/khamitovar-frontend-docker/sandbox-frontend:latest
-    pull_policy: always
+    image: ${REPOSITORY_FRONTEND}:${IMAGE_TAG}
     env_file:
-      - .env.frontend
+      - .env
     ports:
       - "8888:8888"
     depends_on:
