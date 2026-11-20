@@ -1,6 +1,6 @@
 apiVersion: v2
 name: sandbox
-description: Sandbox backend and frontend
+description: Sandbox application
 type: application
 version: 0.1.0
 appVersion: "1.0"
