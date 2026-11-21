@@ -1,14 +1,16 @@
+
 name: CI
 
 on:
   push:
     branches: ['**']
-  workflow_dispatch:
-    inputs:
-      VERSION:
-        description: 'Previous version for redeploy/rollback; empty means new build'
-        required: false
-        type: string
+  # workflow_dispatch:
+
+    # inputs:
+    #   VERSION:
+    #     description: 'Previous version for redeploy/rollback; empty means new build'
+    #     required: false
+    #     type: string
 
 permissions:
   contents: read
@@ -22,21 +24,18 @@ jobs:
     steps:
       - name: Choose version
         id: set
-        env:
-          REQUESTED_VERSION: ${{ inputs.VERSION }}
         run: |
           set -euo pipefail
-          if [[ -n "$REQUESTED_VERSION" ]]; then
-            [[ "$REQUESTED_VERSION" =~ ^[0-9]{8}-[0-9]{6}$ ]] || { echo 'Invalid VERSION'; exit 1; }
-            VERSION="$REQUESTED_VERSION"
-          else
-            VERSION="$(date -u +%Y%m%d-%H%M%S)"
-          fi
+
+          VERSION="$(date -u +%Y%m%d-%H%M%S)"
+
+          echo "Generated version: $VERSION"
+          echo "Generated version: $VERSION" >> "$GITHUB_STEP_SUMMARY"
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
   test:
-    if: ${{ github.event_name == 'push' || inputs.VERSION == '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -79,7 +78,6 @@ jobs:
 
   build:
     needs: [version, test]
-    if: ${{ github.event_name == 'push' || inputs.VERSION == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -87,24 +85,30 @@ jobs:
     strategy:
       matrix:
         component: [backend, frontend]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Configure HTTP Nexus
-        env:
-          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
-        run: |
-          set -euo pipefail
-          [[ -n "$NEXUS_HOST" && "$NEXUS_HOST" != *"://"* && "$NEXUS_HOST" != */* ]] || { echo 'NEXUS_HOST must be a registry host:port without a URL scheme or path'; exit 1; }
-          printf '{"insecure-registries":["%s"]}\n' "$NEXUS_HOST" | sudo tee /etc/docker/daemon.json > /dev/null
-          sudo systemctl restart docker
-          printf '[registry."%s"]\n  http = true\n' "$NEXUS_HOST" > "$RUNNER_TEMP/buildkitd.toml"
+
+      # - name: Configure HTTP Nexus
+      #   env:
+      #     NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+      #   run: |
+      #     set -euo pipefail
+      #     [[ -n "$NEXUS_HOST" && "$NEXUS_HOST" != *"://"* && "$NEXUS_HOST" != */* ]] || { echo 'NEXUS_HOST must be a registry host:port without a URL scheme or path'; exit 1; }
+      #     printf '{"insecure-registries":["%s"]}\n' "$NEXUS_HOST" | sudo tee /etc/docker/daemon.json > /dev/null
+      #     sudo systemctl restart docker
+      #     printf '[registry."%s"]\n  http = true\n' "$NEXUS_HOST" > "$RUNNER_TEMP/buildkitd.toml"
+
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-        with:
-          buildkitd-config: ${{ runner.temp }}/buildkitd.toml
+
+
+      # with:
+      #   buildkitd-config: ${{ runner.temp }}/buildkitd.toml
+
 
       - name: Login to GHCR
         uses: docker/login-action@v4
@@ -113,20 +117,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Nexus
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ secrets.NEXUS_HOST }}
-          username: ${{ secrets.NEXUS_REPO_USER }}
-          password: ${{ secrets.NEXUS_REPO_PASS }}
+
+      # - name: Login to Nexus
+      #   uses: docker/login-action@v4
+      #   with:
+      #     registry: ${{ secrets.NEXUS_HOST }}
+      #     username: ${{ secrets.NEXUS_REPO_USER }}
+      #     password: ${{ secrets.NEXUS_REPO_PASS }}
 
       - name: Generate Docker tags
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: |
-            ghcr.io/${{ needs.version.outputs.owner }}/sandbox-${{ matrix.component }}
-            ${{ secrets.NEXUS_HOST }}/khamitovar-${{ matrix.component }}-docker/sandbox-${{ matrix.component }}
+          images: ghcr.io/${{ needs.version.outputs.owner }}/sandbox-${{ matrix.component }}
+
+          # images: ${{ secrets.NEXUS_HOST }}/khamitovar-${{ matrix.component }}-docker/sandbox-${{ matrix.component }}
+
           tags: |
             type=raw,value=${{ needs.version.outputs.version }}
             type=sha,format=short
@@ -142,85 +148,86 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
 
-  deploy:
-    needs: [version, build]
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.version.result == 'success' && (needs.build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.VERSION != '' && needs.build.result == 'skipped')) }}
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Prepare files
-        env:
-          APP_ENV_FILE: ${{ secrets.APP_ENV_FILE || vars.APP_ENV_FILE }}
-          IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
-          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
-          OWNER: ${{ needs.version.outputs.owner }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          [[ -n "$APP_ENV_FILE" ]] || { echo 'APP_ENV_FILE is empty'; exit 1; }
-          mkdir -p deploy-files
-          IMAGE_REGISTRY="${IMAGE_REGISTRY:-$NEXUS_HOST}"
-          if [[ "$IMAGE_REGISTRY" == "$NEXUS_HOST" ]]; then
-            REPO_BACKEND="$NEXUS_HOST/khamitovar-backend-docker/sandbox-backend"
-            REPO_FRONTEND="$NEXUS_HOST/khamitovar-frontend-docker/sandbox-frontend"
-          elif [[ "$IMAGE_REGISTRY" == 'ghcr.io' ]]; then
-            REPO_BACKEND="ghcr.io/$OWNER/sandbox-backend"
-            REPO_FRONTEND="ghcr.io/$OWNER/sandbox-frontend"
-          else
-            echo 'IMAGE_REGISTRY must be empty, NEXUS_HOST, or ghcr.io'
-            exit 1
-          fi
-          {
-            printf '%s\n' "$APP_ENV_FILE"
-            printf 'IMAGE_REGISTRY=%s\n' "$IMAGE_REGISTRY"
-            printf 'IMAGE_TAG=%s\n' "$VERSION"
-            printf 'VERSION=%s\n' "$VERSION"
-            printf 'REPOSITORY_BACKEND=%s\n' "$REPO_BACKEND"
-            printf 'REPOSITORY_FRONTEND=%s\n' "$REPO_FRONTEND"
-          } > deploy-files/.env
-          cp docker-compose.yaml deploy.sh deploy-files/
-
-      - name: Deploy to VM
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
-          VM_SSH_KNOWN_HOSTS: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
-          IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
-          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
-          NEXUS_USER: ${{ secrets.NEXUS_REPO_USER }}
-          NEXUS_PASS: ${{ secrets.NEXUS_REPO_PASS }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$VM_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          SSH_OPTS=(-i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=1)
-
-          ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_HOST" 'mkdir -p ~/sandbox'
-          scp "${SSH_OPTS[@]}" deploy-files/docker-compose.yaml deploy-files/.env deploy-files/deploy.sh \
-            "$VM_USER@$VM_HOST:/home/$VM_USER/sandbox/"
-
-          IMAGE_REGISTRY="${IMAGE_REGISTRY:-$NEXUS_HOST}"
-          if [[ "$IMAGE_REGISTRY" == 'ghcr.io' ]]; then
-            REGISTRY_USER="$GHCR_USER"
-            REGISTRY_PASS="$GHCR_TOKEN"
-          else
-            REGISTRY_USER="$NEXUS_USER"
-            REGISTRY_PASS="$NEXUS_PASS"
-          fi
-          [[ -n "$REGISTRY_PASS" ]] || { echo 'Registry password/token is missing'; exit 1; }
-          printf '%s' "$REGISTRY_PASS" | ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_HOST" \
-            "docker login '$IMAGE_REGISTRY' -u '$REGISTRY_USER' --password-stdin"
-          ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_HOST" 'cd ~/sandbox && bash ./deploy.sh'
+  # deploy:
+  #   needs: [version, build]
+  #   if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.version.result == 'success' && (needs.build.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.VERSION != '' && needs.build.result == 'skipped')) }}
+  #   runs-on: ubuntu-latest
+  #   environment: production
+  #   permissions:
+  #     contents: read
+  #     packages: read
+  #
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v6
+  #
+  #     - name: Prepare files
+  #       env:
+  #         APP_ENV_FILE: ${{ secrets.APP_ENV_FILE || vars.APP_ENV_FILE }}
+  #         IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
+  #         NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+  #         OWNER: ${{ needs.version.outputs.owner }}
+  #         VERSION: ${{ needs.version.outputs.version }}
+  #       run: |
+  #         set -euo pipefail
+  #         [[ -n "$APP_ENV_FILE" ]] || { echo 'APP_ENV_FILE is empty'; exit 1; }
+  #         mkdir -p deploy-files
+  #         IMAGE_REGISTRY="${IMAGE_REGISTRY:-$NEXUS_HOST}"
+  #         if [[ "$IMAGE_REGISTRY" == "$NEXUS_HOST" ]]; then
+  #           REPO_BACKEND="$NEXUS_HOST/khamitovar-backend-docker/sandbox-backend"
+  #           REPO_FRONTEND="$NEXUS_HOST/khamitovar-frontend-docker/sandbox-frontend"
+  #         elif [[ "$IMAGE_REGISTRY" == 'ghcr.io' ]]; then
+  #           REPO_BACKEND="ghcr.io/$OWNER/sandbox-backend"
+  #           REPO_FRONTEND="ghcr.io/$OWNER/sandbox-frontend"
+  #         else
+  #           echo 'IMAGE_REGISTRY must be empty, NEXUS_HOST, or ghcr.io'
+  #           exit 1
+  #         fi
+  #         {
+  #           printf '%s\n' "$APP_ENV_FILE"
+  #           printf 'IMAGE_REGISTRY=%s\n' "$IMAGE_REGISTRY"
+  #           printf 'IMAGE_TAG=%s\n' "$VERSION"
+  #           printf 'VERSION=%s\n' "$VERSION"
+  #           printf 'REPOSITORY_BACKEND=%s\n' "$REPO_BACKEND"
+  #           printf 'REPOSITORY_FRONTEND=%s\n' "$REPO_FRONTEND"
+  #         } > deploy-files/.env
+  #         cp docker-compose.yaml deploy.sh deploy-files/
+  #
+  #     - name: Deploy to VM
+  #       env:
+  #         VM_HOST: ${{ secrets.VM_HOST }}
+  #         VM_USER: ${{ secrets.VM_USER }}
+  #         VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+  #         VM_SSH_KNOWN_HOSTS: ${{ secrets.VM_SSH_KNOWN_HOSTS }}
+  #         IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
+  #         NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+  #         NEXUS_USER: ${{ secrets.NEXUS_REPO_USER }}
+  #         NEXUS_PASS: ${{ secrets.NEXUS_REPO_PASS }}
+  #         GHCR_USER: ${{ github.actor }}
+  #         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         set -euo pipefail
+  #         mkdir -p ~/.ssh
+  #         chmod 700 ~/.ssh
+  #         printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/deploy_key
+  #         chmod 600 ~/.ssh/deploy_key
+  #         printf '%s\n' "$VM_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+  #         chmod 600 ~/.ssh/known_hosts
+  #         SSH_OPTS=(-i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=1)
+  #
+  #         ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_HOST" 'mkdir -p ~/sandbox'
+  #         scp "${SSH_OPTS[@]}" deploy-files/docker-compose.yaml deploy-files/.env deploy-files/deploy.sh \
+  #           "$VM_USER@$VM_HOST:/home/$VM_USER/sandbox/"
+  #
+  #         IMAGE_REGISTRY="${IMAGE_REGISTRY:-$NEXUS_HOST}"
+  #         if [[ "$IMAGE_REGISTRY" == 'ghcr.io' ]]; then
+  #           REGISTRY_USER="$GHCR_USER"
+  #           REGISTRY_PASS="$GHCR_TOKEN"
+  #         else
+  #           REGISTRY_USER="$NEXUS_USER"
+  #           REGISTRY_PASS="$NEXUS_PASS"
+  #         fi
+  #         [[ -n "$REGISTRY_PASS" ]] || { echo 'Registry password/token is missing'; exit 1; }
+  #         printf '%s' "$REGISTRY_PASS" | ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_HOST" \
+  #           "docker login '$IMAGE_REGISTRY' -u '$REGISTRY_USER' --password-stdin"
+  #         ssh "${SSH_OPTS[@]}" "$VM_USER@$VM_HOST" 'cd ~/sandbox && bash ./deploy.sh'
