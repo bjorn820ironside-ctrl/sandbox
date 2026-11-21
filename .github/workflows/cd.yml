@@ -1,0 +1,179 @@
+
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      VERSION:
+        description: "GHCR image tag (YYYYMMDD-HHMMSS)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-k8s-lab4
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          [[ "$VERSION" =~ ^[0-9]{8}-[0-9]{6}$ ]] || {
+            echo "Invalid VERSION: $VERSION"
+            exit 1
+          }
+
+          echo "Deploying version: $VERSION"
+          echo "### Deploy version: $VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Yandex Cloud CLI
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://storage.yandexcloud.net/yandexcloud-yc/install.sh \
+            -o "$RUNNER_TEMP/install-yc.sh"
+
+          bash "$RUNNER_TEMP/install-yc.sh" \
+            -i "$HOME/yandex-cloud" -n
+
+          echo "$HOME/yandex-cloud/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Yandex Cloud
+        env:
+          YC_SA_KEY: ${{ secrets.YC_SA_KEY }}
+          YC_CLOUD_ID: ${{ vars.YC_CLOUD_ID }}
+          YC_FOLDER_ID: ${{ vars.YC_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$YC_SA_KEY" ]] || {
+            echo "YC_SA_KEY is missing"
+            exit 1
+          }
+
+          [[ -n "$YC_CLOUD_ID" ]] || {
+            echo "YC_CLOUD_ID is missing"
+            exit 1
+          }
+
+          [[ -n "$YC_FOLDER_ID" ]] || {
+            echo "YC_FOLDER_ID is missing"
+            exit 1
+          }
+
+          install -m 600 /dev/null "$RUNNER_TEMP/yc-sa-key.json"
+          printf '%s' "$YC_SA_KEY" > "$RUNNER_TEMP/yc-sa-key.json"
+
+          yc config profile create ci
+          yc config profile activate ci
+          yc config set service-account-key "$RUNNER_TEMP/yc-sa-key.json"
+          yc config set cloud-id "$YC_CLOUD_ID"
+          yc config set folder-id "$YC_FOLDER_ID"
+
+          yc config list
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.35.1
+
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$KUBE_CONFIG" ]] || {
+            echo "KUBE_CONFIG is missing"
+            exit 1
+          }
+
+          mkdir -p "$HOME/.kube"
+          chmod 700 "$HOME/.kube"
+
+          printf '%s\n' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+          sed -i \
+            -e 's|/home/cordell/yandex-cloud/bin/yc|yc|g' \
+            -e 's|--profile=default|--profile=ci|g' \
+            "$HOME/.kube/config"
+
+          kubectl config use-context yc-k8s-cluster-sandbox
+
+          echo "checking kuber connection"
+          kubectl get nodes -o wide
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Validate Helm chart
+        run: |
+          set -euo pipefail
+
+          helm lint helm/sandbox
+
+      - name: Check rendered images
+        env:
+          VERSION: ${{ inputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          helm template sandbox helm/sandbox \
+            --namespace sandbox-k8s-lab4 \
+            --set-string imageTag="$VERSION" \
+            > "$RUNNER_TEMP/rendered.yaml"
+
+          grep 'image:' "$RUNNER_TEMP/rendered.yaml"
+
+      - name: Deploy with Helm
+        env:
+          VERSION: ${{ inputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          helm upgrade --install sandbox helm/sandbox \
+            --namespace sandbox-k8s-lab4 \
+            --create-namespace \
+            --set-string imageTag="$VERSION" \
+            --wait \
+            --atomic \
+            --timeout 5m
+
+      - name: Check deployment
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status deployment/sandbox-backend \
+            -n sandbox-k8s-lab4 --timeout=180s
+
+          kubectl rollout status deployment/sandbox-frontend \
+            -n sandbox-k8s-lab4 --timeout=180s
+
+          echo "kuber resources"
+
+          kubectl get deployments,pods,services \
+            -n sandbox-k8s-lab4 -o wide
+
+          echo "helm releases"
+
+          helm list -n sandbox-k8s-lab4
+
+          echo "helm history"
+
+          helm history sandbox -n sandbox-k8s-lab4
